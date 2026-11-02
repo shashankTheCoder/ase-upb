@@ -1,186 +1,124 @@
-import urllib.request
-import urllib.error
 import json
-import re
+import ssl
+import certifi
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 
-def get_package_info(package_name, version=None):
-    if version:
-        url = f"https://pypi.org/pypi/{package_name}/{version}/json"
-    else:
-        url = f"https://pypi.org/pypi/{package_name}/json"
+PYTHON_VERSION = Version("3.11")
+
+
+def get_pypi_data(url):
+    request = Request(url, headers={"User-Agent": "Python-311-Dependency-Checker/1.0"})
+
+    context = ssl.create_default_context(cafile=certifi.where())
 
     try:
-        with urllib.request.urlopen(url, timeout=15) as response:
-            return json.loads(response.read().decode())
+        with urlopen(request, timeout=15, context=context) as response:
+            return json.loads(response.read().decode("utf-8"))
 
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
+    except HTTPError as error:
+        if error.code == 404:
             return None
-        print(f"HTTP Error: {e.code} - {e.reason}")
-
-    except urllib.error.URLError as e:
-        print(f"URL Error: {e.reason}")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-    return None
+        raise
 
 
-def parse_package(package_input):
-    """
-    Supports:
-    requests == 2.31.0
-    django>=4.2
-    flask
-    numpy~=1.26
-    """
+def get_minimum_requirement(requires_python):
+    specifiers = SpecifierSet(requires_python)
 
-    match = re.match(r"^\s*([A-Za-z0-9_.-]+)\s*(.*)$", package_input)
+    minimum = None
+    minimum_text = ""
 
-    if not match:
-        return None, None
+    for specifier in specifiers:
+        if specifier.operator in (">=", ">", "~=", "=="):
+            try:
+                version = Version(specifier.version)
 
-    package_name = match.group(1)
-    version_spec = match.group(2).strip()
+                if minimum is None or version > minimum:
+                    minimum = version
+                    minimum_text = str(specifier)
+            except Exception:
+                pass
 
-    return package_name, version_spec or None
+    return minimum, minimum_text
 
 
-def check_dependencies(packages, target_python="3.11"):
-    found = []
-    not_found = []
-    incompatible = []
-    compatible = []
-    errors = []
+def check_dependencies():
+    with open("requirements.txt", "r", encoding="utf-8") as file:
+        lines = file.readlines()
 
-    target_version = Version(target_python)
+    total = len(lines)
+    not_found = 0
+    incompatible = 0
 
-    for package_input in packages:
-        package_name, version_spec = parse_package(package_input)
-
-        if not package_name:
-            errors.append(package_input)
-            continue
-
-        print(f"Checking: {package_input}")
-
-        # Extract exact version if specified
-        exact_version = None
-
-        if version_spec:
-            exact_match = re.match(r"^==\s*([0-9][A-Za-z0-9.+!-]*)$", version_spec)
-            if exact_match:
-                exact_version = exact_match.group(1)
-
-        data = get_package_info(package_name, exact_version)
-
-        if not data:
-            not_found.append(package_input)
-            continue
-
-        found.append(package_input)
-
-        info = data.get("info", {})
-        requires_python = info.get("requires_python") or ""
-
-        try:
-            python_spec = SpecifierSet(requires_python)
-
-            if requires_python and not python_spec.contains(
-                target_version, prereleases=True
-            ):
-                incompatible.append(
-                    {"package": package_input, "required_python": requires_python}
-                )
-            else:
-                compatible.append(
-                    {
-                        "package": package_input,
-                        "required_python": requires_python or "Not specified",
-                    }
-                )
-
-        except Exception:
-            errors.append(package_input)
-
-    # Highest minimum Python requirement
     highest_requirement = None
-    highest_version = None
 
-    for item in incompatible + compatible:
-        spec = item["required_python"]
+    for line in lines:
+        line = line.strip()
 
-        if spec == "Not specified":
+        if not line or line.startswith("#"):
             continue
 
-        for part in spec.split(","):
-            part = part.strip()
+        if "==" not in line:
+            continue
 
-            match = re.match(r">=?\s*(\d+(?:\.\d+)*)", part)
+        name, version = line.split("==", 1)
 
-            if match:
-                version = Version(match.group(1))
+        name = name.strip()
+        version = version.strip()
 
-                if highest_version is None or version > highest_version:
-                    highest_version = version
-                    highest_requirement = item
+        package_url = f"https://pypi.org/pypi/{name}/json"
+        package_data = get_pypi_data(package_url)
 
-    # Report
-    print("\n" + "=" * 60)
-    print("PYTHON DEPENDENCY COMPATIBILITY REPORT")
-    print("=" * 60)
+        if package_data is None:
+            not_found += 1
+            continue
 
-    print(f"\nTarget Python version: {target_python}")
-    print(f"Total packages checked: {len(packages)}")
-    print(f"Found on PyPI: {len(found)}")
-    print(f"Not found on PyPI: {len(not_found)}")
-    print(f"Compatible: {len(compatible)}")
-    print(f"Incompatible: {len(incompatible)}")
-    print(f"Errors: {len(errors)}")
+        release_url = f"https://pypi.org/pypi/{name}/{version}/json"
 
-    print("\n--- NOT FOUND ON PYPI ---")
-    for package in not_found:
-        print(package)
+        release_data = get_pypi_data(release_url)
 
-    print("\n--- INCOMPATIBLE WITH PYTHON 3.11 ---")
-    for item in incompatible:
-        print(f"{item['package']} (requires Python {item['required_python']})")
+        if release_data is None:
+            not_found += 1
+            continue
 
-    print("\n--- HIGHEST PYTHON REQUIREMENT ---")
-    if highest_requirement:
-        print(f"{highest_requirement['package']} (>= {highest_version})")
+        requires_python = release_data["info"].get("requires_python")
+
+        if not requires_python:
+            continue
+
+        specifiers = SpecifierSet(requires_python)
+
+        if not specifiers.contains(PYTHON_VERSION):
+            incompatible += 1
+
+        minimum, minimum_text = get_minimum_requirement(requires_python)
+
+        if minimum is not None:
+            if highest_requirement is None or minimum > highest_requirement[0]:
+                highest_requirement = (minimum, name, version, minimum_text)
+
+    print("Dependencies checked:", total)
+    print("Not found on PyPI:", not_found)
+    print("Incompatible with Python 3.11:", incompatible)
+
+    if highest_requirement is not None:
+        minimum, name, version, requirement = highest_requirement
+
+        print(f"Highest requirement: {name}=={version} ({requirement})")
     else:
-        print("No minimum Python requirement found.")
-
-    print("\n--- COMPATIBLE PACKAGES ---")
-    for item in compatible:
-        print(f"{item['package']} (Python: {item['required_python']})")
-
-    print("\n--- INVALID INPUT / ERRORS ---")
-    for item in errors:
-        print(item)
-
-    print("=" * 60)
+        print("Highest requirement: None found")
 
 
 if __name__ == "__main__":
-    print("Enter package dependencies (one per line).")
-    print("Example: requests == 2.31.0")
-    print("Type 'done' when finished.\n")
+    try:
+        check_dependencies()
 
-    packages = []
+    except FileNotFoundError:
+        print("Error: requirements.txt file not found.")
 
-    while True:
-        package = input("Package: ").strip()
-
-        if package.lower() == "done":
-            break
-
-        if package:
-            packages.append(package)
-
-    check_dependencies(packages, target_python="3.11")
+    except (URLError, RuntimeError) as error:
+        print("Network error:", error)
